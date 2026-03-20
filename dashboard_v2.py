@@ -612,7 +612,10 @@ def bar_html(val, mx, max_w=80):
 
 def build_macro_card(macro):
     if not macro:
-        return ""
+        return '''<div class="card"><div style="display:flex;justify-content:space-between;margin-bottom:6px">
+          <div><b style="font-size:16px">DXY</b> <span style="color:#E24B4A;font-size:12px">[FAIL]</span></div>
+          <span class="tag">Yahoo+FRED</span></div>
+          <div style="font-size:10px;color:#888">USD macro data unavailable.</div></div>'''
     dxy = macro.get("dxy")
     broad = macro.get("broad_usd")
     tone = macro["label"]
@@ -622,34 +625,31 @@ def build_macro_card(macro):
     broad_symbol = broad.get("series") if broad else "N/A"
     dxy_latest = f"{dxy['latest']:.2f}" if dxy else "N/A"
     broad_latest = f"{broad['latest']:.2f}" if broad else "N/A"
-    broad_date = f" ({broad['date']})" if broad and broad.get("date") else ""
+    dxy_color = _color_pct(dxy.get("pct_5d") if dxy else None)
+    broad_color = _color_pct(broad.get("pct_5d") if broad else None)
 
-    return f'''<div class="card" style="margin-bottom:10px">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-        <div>
-          <div class="card-title" style="margin-bottom:2px">USD macro overlay</div>
-          <div style="font-size:10px;color:#888">{macro["reason"]}</div>
-        </div>
-        <div style="padding:4px 10px;border-radius:999px;font-size:10px;font-weight:700;color:{tone_color};background:{tone_color}12">{tone}</div>
-      </div>
-      <div class="metric-row">
+    return f'''<div class="card">
+      <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+        <div><b style="font-size:16px">DXY</b> <span style="color:#888;font-size:13px">{dxy_latest} <span class="tag">[LIVE]</span></span></div>
+        <span class="tag">Yahoo+FRED</span></div>
+      <div class="metric-row" style="margin-bottom:5px">
         <div class="metric">
-          <div class="metric-label">DXY proxy {dxy_symbol} <span class="tag">[LIVE]</span></div>
-          <div class="metric-value">{dxy_latest}</div>
-          <div style="font-size:10px;color:{_color_pct(dxy.get("pct_5d") if dxy else None)}">{_fmt_pct(dxy.get("pct_5d") if dxy else None)} 5d · {_fmt_pct(dxy.get("pct_20d") if dxy else None)} 20d</div>
+          <div class="metric-label">DXY proxy {dxy_symbol}</div>
+          <div class="metric-value" style="color:{dxy_color}">{_fmt_pct(dxy.get("pct_5d") if dxy else None)} 5d</div>
+          <div style="font-size:10px;color:#888">{_fmt_pct(dxy.get("pct_20d") if dxy else None)} 20d</div>
         </div>
         <div class="metric">
-          <div class="metric-label">Broad USD {broad_symbol} <span class="tag">[LIVE]</span></div>
-          <div class="metric-value">{broad_latest}</div>
-          <div style="font-size:10px;color:{_color_pct(broad.get("pct_5d") if broad else None)}">{_fmt_pct(broad.get("pct_5d") if broad else None)} 5d · {_fmt_pct(broad.get("pct_20d") if broad else None)} 20d</div>
+          <div class="metric-label">Broad USD {broad_symbol}</div>
+          <div class="metric-value" style="color:{broad_color}">{_fmt_pct(broad.get("pct_5d") if broad else None)} 5d</div>
+          <div style="font-size:10px;color:#888">{_fmt_pct(broad.get("pct_20d") if broad else None)} 20d</div>
         </div>
         <div class="metric">
           <div class="metric-label">Macro read</div>
           <div class="metric-value" style="color:{tone_color}">{tone}</div>
-          <div style="font-size:10px;color:#888">{macro.get("summary","")}</div>
+          <div style="font-size:10px;color:#888">{macro.get("reason","")}</div>
         </div>
       </div>
-      <div style="margin-top:6px;font-size:10px;color:#888">DXY is a live market proxy. Broad USD is the official FRED index and updates daily{broad_date}.</div>
+      <div style="padding:3px 8px;border-radius:4px;font-size:10px;color:{tone_color};background:{tone_color}08">{macro.get("summary","")}</div>
     </div>'''
 
 # ── Checklist ─────────────────────────────────────────────────────────────────
@@ -689,7 +689,7 @@ def _market_bias(label, gex_data, hist_data=None, crypto_data=None, macro=None):
             if iv_hv > 0.10: signals.append(("bear", f"IV−HV +{iv_hv*100:.0f}% — fear elevated"))
             elif iv_hv < -0.05: signals.append(("bull", f"IV−HV {iv_hv*100:.0f}% — vol cheap"))
     if crypto_data:
-        for sym, thresh in [("BTC", 0.02), ("ETH", 0.02), ("SOL", 0.03)]:
+        for sym, thresh in [("BTC", 0.02), ("ETH", 0.02)]:
             bn = crypto_data.get(sym, {}).get("binance")
             p = crypto_data.get(sym, {}).get("perp")
             # prefer Binance (more representative), fall back to Deribit
@@ -1068,7 +1068,6 @@ def build_html(crypto, us_data, conviction, macro=None, serve_mode=False):
     else:         sess,sc = "Off-hours","#888"
 
     checklist = build_checklist(crypto, us_data, conviction, now, macro=macro)
-    macro_card = build_macro_card(macro)
 
     # Refresh button + data age bar
     rerun_note = "" if serve_mode else ' <span style="font-size:8px;color:#bbb">(re-run script for fresh data)</span>'
@@ -1204,6 +1203,8 @@ def build_html(crypto, us_data, conviction, macro=None, serve_mode=False):
           </div>
           <div style="padding:3px 8px;border-radius:4px;font-size:10px;color:{dom_c};background:{dom_c}08">{dom_s}</div>
           {gh}</div>'''
+
+    crypto_cards += build_macro_card(macro)
 
     # ── US cards with full Greeks ──
     us_cards = ""
@@ -1388,8 +1389,7 @@ a:hover{{opacity:.7}}
 </script>
   <span id="session-badge" style="padding:3px 10px;border-radius:4px;font-size:10px;font-weight:600;color:{sc};background:{sc}12">{sess}</span></div>
 {refresh_bar}
-{POWER_HOUR_JS}
-    {macro_card}
+    {POWER_HOUR_JS}
     {checklist}
 <script>
 (function(){{
@@ -1460,7 +1460,7 @@ a:hover{{opacity:.7}}
 </script>
 {cv}
 {links}
-<div style="font-size:10px;font-weight:600;color:#999;margin:10px 0 6px;text-transform:uppercase;letter-spacing:.5px">Crypto</div>
+    <div style="font-size:10px;font-weight:600;color:#999;margin:10px 0 6px;text-transform:uppercase;letter-spacing:.5px">Crypto & Dollar</div>
 <div class="grid" style="margin-bottom:10px">{crypto_cards}</div>
 <div style="font-size:10px;font-weight:600;color:#999;margin:10px 0 6px;text-transform:uppercase;letter-spacing:.5px">Equities & Commodities — full Greeks</div>
 <div class="grid">{us_cards}</div>
@@ -1490,11 +1490,6 @@ def score(crypto, us_data, macro=None):
         fr_e = eth_bn["funding_rate"]
         if fr_e*100>0.02: sigs.append((f"ETH Binance funding +{fr_e*100:.4f}%: longs crowded [LIVE]","bearish"))
         elif fr_e*100<-0.02: sigs.append((f"ETH Binance funding {fr_e*100:.4f}%: shorts crowded [LIVE]","bullish"))
-    sol_bn = crypto.get("SOL",{}).get("binance")
-    if sol_bn:
-        fr_s = sol_bn["funding_rate"]
-        if fr_s*100>0.03: sigs.append((f"SOL Binance funding +{fr_s*100:.4f}%: longs crowded [LIVE]","bearish"))
-        elif fr_s*100<-0.03: sigs.append((f"SOL Binance funding {fr_s*100:.4f}%: shorts crowded [LIVE]","bullish"))
     if bg:
         if bg["net_gex"]>0: sigs.append(("BTC GEX: positive γ [CALC]","neutral"))
         else: sigs.append(("BTC GEX: negative γ [CALC]","neutral"))
@@ -1591,7 +1586,7 @@ def fetch_all(serve_mode=False):
         print(f"{'='*60}\n")
 
         crypto = {}
-        for a in ["BTC","ETH","SOL"]:
+        for a in ["BTC","ETH"]:
             print(f"  [{a}] Perpetual...")
             p = deribit_perp(a)
             deribit_rate = _perp_funding_rate(p)

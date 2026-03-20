@@ -46,11 +46,17 @@ except ImportError:
 
 UZT = timezone(timedelta(hours=5))
 DERIBIT = "https://www.deribit.com/api/v2/public"
+DERIBIT_PERPS = {
+    "BTC": "BTC-PERPETUAL",
+    "ETH": "ETH-PERPETUAL",
+    "SOL": "SOL_USDC-PERPETUAL",
+}
 VERIFY = "--verify" in sys.argv
 CRYPTO_ONLY = "--crypto" in sys.argv
 SERVE = "--serve" in sys.argv
 SERVE_PORT = 8050
 REFRESH_INTERVAL = 300  # seconds (5 min)
+YF_MAX_EXPIRIES = 12
 fetch_log = []
 _cached_html = ""
 _last_fetch_ts = 0
@@ -97,6 +103,24 @@ def _safe_oi(raw):
 def _safe_float(raw):
     return float(raw) if raw is not None and not (isinstance(raw, float) and math.isnan(raw)) else 0.0
 
+def _perp_funding_rate(perp):
+    if not perp:
+        return None
+    if perp.get("funding_8h") is not None:
+        return perp.get("funding_8h")
+    return perp.get("current_funding")
+
+def _yf_expiry_years(exp_date):
+    # Treat expiry as end-of-day UTC so same-day chains are not dropped at midnight.
+    expiry_dt = datetime.strptime(exp_date, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+    secs = (expiry_dt - datetime.now(timezone.utc)).total_seconds()
+    return max(secs / (365.25 * 24 * 3600), 0.0)
+
+def _yf_weight_value(row, field):
+    if field == "volume":
+        return _safe_oi(row.get("volume", 0))
+    return _safe_oi(row.get("openInterest", 0))
+
 # ── Deribit ───────────────────────────────────────────────────────────────────
 def binance_funding(ccy):
     """Fetch Binance perpetual funding rate — largest market by OI/volume."""
@@ -124,10 +148,12 @@ def dget(method, params=None):
         log("Deribit", method, "FAIL", str(e)); return None
 
 def deribit_perp(ccy):
-    t = dget("ticker", {"instrument_name": f"{ccy}-PERPETUAL"})
+    instrument_name = DERIBIT_PERPS.get(ccy, f"{ccy}-PERPETUAL")
+    t = dget("ticker", {"instrument_name": instrument_name})
     if not t: return None
     return {"current_funding": t.get("current_funding"), "funding_8h": t.get("funding_8h"),
             "open_interest": t.get("open_interest"), "index_price": t.get("index_price"),
+            "instrument_name": instrument_name,
             "volume_24h": t.get("stats",{}).get("volume"), "_src": "Deribit"}
 
 def deribit_gex(ccy):
@@ -257,6 +283,8 @@ def _detect_opex(symbol, valid_exps, tk, spot):
                        if _safe_oi(r.get("openInterest", 0)) > 0 and
                        spot * 0.90 < r.get("strike", 0) < spot * 1.10)
             total_oi = c_oi + p_oi
+            if total_oi <= 0:
+                continue
             results.append({"exp": exp, "type": otype, "days": T_days,
                             "call_oi": c_oi, "put_oi": p_oi, "total_oi": total_oi,
                             "is_today": exp == today, "is_tomorrow": exp == tomorrow})
@@ -275,27 +303,66 @@ def yf_greeks(symbol, hist_data):
         exps = tk.options
         if not exps: log("yfinance", f"{symbol}/options", "FAIL", "none"); return None
         today_str = datetime.now().strftime("%Y-%m-%d")
-        valid_exps = [e for e in exps if e > today_str]
+        valid_exps = [e for e in exps if e >= today_str]
         if not valid_exps: log("yfinance", f"{symbol}/options", "FAIL", "all expired"); return None
-        near = valid_exps[:4]
-        log("yfinance", f"{symbol}/options", "OK", f"{len(valid_exps)} valid exps, using {near}")
+        sampled_exps = valid_exps[:YF_MAX_EXPIRIES]
+        log("yfinance", f"{symbol}/options", "OK", f"{len(valid_exps)} valid exps, sampling {sampled_exps}")
 
         gex_by_strike = defaultdict(float)
         agg = defaultdict(lambda: {"delta":0,"gamma":0,"theta":0,"vega":0,"call_oi":0,"put_oi":0})
         c_oi = 0; p_oi = 0; n = 0; iv_sum = 0
+        chains = []
+        oi_rows = 0
+        vol_rows = 0
 
-        for exp in near:
-            try: chain = tk.option_chain(exp)
-            except Exception as e: log("yfinance", f"{symbol}/{exp}", "FAIL", str(e)); continue
+        for exp in sampled_exps:
+            try:
+                chain = tk.option_chain(exp)
+            except Exception as e:
+                log("yfinance", f"{symbol}/{exp}", "FAIL", str(e))
+                continue
             log("yfinance", f"{symbol}/{exp}", "OK", f"c={len(chain.calls)} p={len(chain.puts)}")
-            T_days = (datetime.strptime(exp, "%Y-%m-%d") - datetime.now()).days
-            if T_days < 1: continue
-            T = T_days / 365.25
+            T = _yf_expiry_years(exp)
+            if T <= 0:
+                continue
+            exp_oi_rows = 0
+            exp_vol_rows = 0
+            for df in (chain.calls, chain.puts):
+                for _, r in df.iterrows():
+                    s = _safe_float(r.get("strike", 0))
+                    iv = _safe_float(r.get("impliedVolatility", 0))
+                    if iv <= 0 or s < spot * 0.85 or s > spot * 1.15:
+                        continue
+                    if _safe_oi(r.get("openInterest", 0)) > 0:
+                        exp_oi_rows += 1
+                    if _safe_oi(r.get("volume", 0)) > 0:
+                        exp_vol_rows += 1
+            oi_rows += exp_oi_rows
+            vol_rows += exp_vol_rows
+            chains.append({"exp": exp, "chain": chain, "T": T, "oi_rows": exp_oi_rows, "vol_rows": exp_vol_rows})
 
+        if not chains:
+            return None
+
+        weight_source = "openInterest" if oi_rows > 0 else "volume"
+        weight_label = "OI" if weight_source == "openInterest" else "Vol"
+        pc_label = "P/C" if weight_source == "openInterest" else "P/C vol"
+        sampled_rows = oi_rows if weight_source == "openInterest" else vol_rows
+        if weight_source == "volume":
+            log("yfinance", f"{symbol}/weights", "CALC", "open interest unavailable, using live volume fallback")
+        else:
+            log("yfinance", f"{symbol}/weights", "OK", f"using open interest ({oi_rows} usable rows)")
+
+        for item in chains:
+            exp = item["exp"]
+            chain = item["chain"]
+            T = item["T"]
+            if _safe_oi(item["oi_rows"] if weight_source == "openInterest" else item["vol_rows"]) == 0:
+                continue
             for opt_type, df in [("call", chain.calls), ("put", chain.puts)]:
                 for _, r in df.iterrows():
                     s = r.get("strike", 0)
-                    oi = _safe_oi(r.get("openInterest", 0))
+                    oi = _yf_weight_value(r, weight_source)
                     iv = _safe_float(r.get("impliedVolatility", 0))
                     if oi <= 0 or iv <= 0: continue
                     if s < spot * 0.85 or s > spot * 1.15: continue
@@ -313,7 +380,8 @@ def yf_greeks(symbol, hist_data):
                     else:                  agg[s]["put_oi"]  += oi; p_oi += oi
                     iv_sum += iv; n += 1
 
-        if n == 0: return None
+        if n == 0:
+            return None
 
         # Totals
         totals = {k: sum(agg[s][k] for s in agg) for k in ["delta","gamma","theta","vega","call_oi","put_oi"]}
@@ -347,11 +415,14 @@ def yf_greeks(symbol, hist_data):
 
         return {"symbol": symbol, "spot": spot, "gex_levels": levels, "gamma_flip": flip,
                 "max_pain": mp, "net_gex": net_gex, "pc_ratio": pc,
-                "call_oi": c_oi, "put_oi": p_oi, "n": n, "exps": near,
+                "call_oi": c_oi, "put_oi": p_oi, "n": n, "exps": [c["exp"] for c in chains],
                 "regime": "Positive gamma (pinning)" if net_gex > 0 else "Negative gamma (trending)",
                 "totals": totals, "top_strikes": top_strikes,
                 "avg_iv": avg_iv, "avg_iv_vs_hv": avg_iv - hv, "hv": hv,
-                "opex": opex_info, "_src": "Yahoo+BS"}
+                "opex": opex_info, "weight_source": weight_source,
+                "weight_label": weight_label, "pc_label": pc_label,
+                "weight_note": "" if weight_source == "openInterest" else "Volume-weighted fallback — Yahoo open interest is zero across sampled expiries.",
+                "sampled_rows": sampled_rows, "_src": "Yahoo+BS"}
     except Exception as e:
         log("yfinance", symbol, "FAIL", str(e)); return None
 
@@ -875,7 +946,7 @@ def build_html(crypto, us_data, conviction, serve_mode=False):
     crypto_cards = ""
     for asset, d in crypto.items():
         perp, gex, bn_data = d.get("perp"), d.get("gex"), d.get("binance")
-        spot = gex["spot"] if gex else (perp.get("index_price") if perp else None)
+        spot = gex["spot"] if gex else (perp.get("index_price") if perp else (bn_data.get("mark_price") if bn_data else None))
         if spot is None:
             crypto_cards += f'<div class="card"><b>{asset}</b> <span style="color:#E24B4A;font-size:12px">[FAIL]</span></div>'
             continue
@@ -883,8 +954,13 @@ def build_html(crypto, us_data, conviction, serve_mode=False):
         bn_rate = bn_data["funding_rate"] if bn_data else None
         bn_v, bn_c, bn_s = fb(bn_rate)
         # Deribit funding (secondary)
-        fv, fc, fs = fb(perp.get("current_funding") if perp else None)
+        fv, fc, fs = fb(_perp_funding_rate(perp))
         oi_usd = perp["open_interest"]*spot if perp and perp.get("open_interest") else None
+        srcs = []
+        if perp: srcs.append("Deribit")
+        if bn_data: srcs.append("Binance")
+        if gex: srcs.append("Options")
+        src_label = "+".join(srcs) if srcs else "N/A"
         gh = ""
         if gex:
             net=gex["net_gex"]; rc="#1D9E75" if net>0 else "#E24B4A"
@@ -911,14 +987,14 @@ def build_html(crypto, us_data, conviction, serve_mode=False):
         crypto_cards += f'''<div class="card">
           <div style="display:flex;justify-content:space-between;margin-bottom:6px">
             <div><b style="font-size:16px">{asset}</b> <span style="color:#888;font-size:13px">${spot:,.2f} <span class="tag">[LIVE]</span></span></div>
-            <span class="tag">Deribit+Binance</span></div>
+            <span class="tag">{src_label}</span></div>
           <div class="metric-row" style="margin-bottom:5px">
             <div class="metric">
               <div class="metric-label">BINANCE FUNDING <span class="tag">[LIVE]</span></div>
               <div class="metric-value" style="color:{bn_c}">{bn_v if bn_data else "N/A"}</div>
             </div>
             <div class="metric">
-              <div class="metric-label">DERIBIT FUNDING <span class="tag">[LIVE]</span></div>
+              <div class="metric-label">DERIBIT 8H FUNDING <span class="tag">[LIVE]</span></div>
               <div class="metric-value" style="color:{fc}">{fv}</div>
             </div>
             <div class="metric"><div class="metric-label">OI [LIVE]</div><div class="metric-value">{fk(oi_usd)}</div></div>
@@ -942,6 +1018,7 @@ def build_html(crypto, us_data, conviction, serve_mode=False):
             mp_v = f"${greeks['max_pain']:,.0f}" if greeks.get("max_pain") else "N/A"
             pc_v = f"{greeks['pc_ratio']:.2f}" if greeks.get("pc_ratio") is not None else "N/A"
             iv_hv_col = "#E24B4A" if greeks["avg_iv_vs_hv"] > 0.05 else "#1D9E75" if greeks["avg_iv_vs_hv"] < -0.02 else "#888"
+            weight_note = f'<div style="margin-bottom:6px;font-size:10px;color:#EF9F27">{greeks["weight_note"]}</div>' if greeks.get("weight_note") else ""
 
             # Strike-level Greeks table
             strike_rows = ""
@@ -967,17 +1044,18 @@ def build_html(crypto, us_data, conviction, serve_mode=False):
 
             greeks_section = f'''
             {opex_badge}
+            {weight_note}
             <!-- Vol metrics -->
             <div class="metric-row" style="margin:8px 0">
               <div class="metric"><div class="metric-label">5d HV</div><div class="metric-value">{hist["hv_ann"]*100:.1f}%</div></div>
               <div class="metric"><div class="metric-label">Avg IV</div><div class="metric-value">{greeks["avg_iv"]*100:.1f}%</div></div>
               <div class="metric"><div class="metric-label">IV−HV</div><div class="metric-value" style="color:{iv_hv_col}">{greeks["avg_iv_vs_hv"]*100:+.1f}%</div></div>
-              <div class="metric"><div class="metric-label">P/C</div><div class="metric-value">{pc_v}</div></div>
+              <div class="metric"><div class="metric-label">{greeks.get("pc_label", "P/C")}</div><div class="metric-value">{pc_v}</div></div>
             </div>
             <!-- GEX + key levels -->
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
               <div>
-                <div style="font-size:10px;font-weight:600;color:#666;margin-bottom:3px">GEX levels <span class="tag">[CALC {greeks["n"]}]</span></div>
+                <div style="font-size:10px;font-weight:600;color:#666;margin-bottom:3px">GEX levels <span class="tag">[CALC {greeks["n"]} rows · {greeks.get("weight_label", "OI")}]</span></div>
                 {gex_bars(greeks["gex_levels"])}
               </div>
               <div>
@@ -1001,7 +1079,7 @@ def build_html(crypto, us_data, conviction, serve_mode=False):
               <tr style="background:#f8f8f6;font-size:9px;color:#aaa">
                 <th style="padding:2px 5px;text-align:left">Strike</th><th style="text-align:left;padding:2px 5px">Net Δ</th>
                 <th style="text-align:left;padding:2px 5px">Net Γ (GEX)</th><th style="text-align:left;padding:2px 5px">Net Θ</th>
-                <th style="text-align:left;padding:2px 5px">Net V</th><th style="text-align:left;padding:2px 5px">C/P OI</th></tr>
+                <th style="text-align:left;padding:2px 5px">Net V</th><th style="text-align:left;padding:2px 5px">C/P {greeks.get("weight_label", "OI")}</th></tr>
               {strike_rows}
             </table></details>'''
 
@@ -1272,68 +1350,74 @@ def score(crypto, us_data):
 def fetch_all(serve_mode=False):
     """Fetch all data and return HTML string."""
     global fetch_log, _cached_html, _last_fetch_ts, _is_fetching
-    if _is_fetching:
-        print("  [SKIP] Already fetching, skipping duplicate call.")
-        return _cached_html
-    _is_fetching = True
-    fetch_log = []  # reset log for each fetch cycle
-    now = datetime.now(UZT)
-    print(f"\n{'='*60}\n  BIAS DASHBOARD v2 — {now.strftime('%A %H:%M UZT')}")
-    if VERIFY: print("  ** VERIFY MODE **")
-    if serve_mode: print(f"  [SERVE] refresh cycle @ {now.strftime('%H:%M:%S')}")
-    print(f"{'='*60}\n")
-
-    crypto = {}
-    for a in ["BTC","ETH","SOL"]:
-        print(f"  [{a}] Perpetual...")
-        p = deribit_perp(a)
-        if p: print(f"  [{a}] ${p['index_price']:,.2f}  deribit_funding={p['current_funding']*100:.4f}%")
-        bn = None
-        if a in ["BTC","ETH"]:
-            bn = binance_funding(a)
-            if bn: print(f"  [{a}] Binance funding={bn['funding_rate']*100:.4f}%")
-        g = None
-        if a in ["BTC","ETH"]:
-            print(f"  [{a}] Options GEX (~30s)...")
-            g = deribit_gex(a)
-            if g: print(f"  [{a}] {g['n']} contracts, flip={'${:,.0f}'.format(g['gamma_flip']) if g.get('gamma_flip') else 'N/A'}")
-        crypto[a] = {"perp": p, "gex": g, "binance": bn}
-
-    us_data = []
-    if not CRYPTO_ONLY and yf:
-        for sym in ["SPY","GLD","USO"]:
-            print(f"\n  [{sym}] 5-day history...")
-            hist = yf_history(sym)
-            if hist:
-                print(f"  [{sym}] spot=${hist['spot']:,.2f}  5d={hist['pct_chg']:+.2f}%  HV={hist['hv_ann']*100:.1f}%")
-                print(f"  [{sym}] Computing full Greeks...")
-                greeks = yf_greeks(sym, hist)
-                if greeks:
-                    print(f"  [{sym}] {greeks['n']} contracts | {greeks['regime']} | flip={'${:,.0f}'.format(greeks['gamma_flip']) if greeks.get('gamma_flip') else 'N/A'} | IV={greeks['avg_iv']*100:.1f}%")
-                    print(f"  [{sym}] Net Δ={greeks['totals']['delta']:+,.0f}  Θ={greeks['totals']['theta']:+,.0f}/d  V={greeks['totals']['vega']:+,.0f}")
-                us_data.append((sym, hist, greeks))
-            else:
-                print(f"  [{sym}] FAIL: no history"); us_data.append((sym, None, None))
-    elif CRYPTO_ONLY: print("\n  Skipping SPY/GLD (--crypto)")
-
-    conv = score(crypto, us_data)
-    html = build_html(crypto, us_data, conv, serve_mode=serve_mode)
-    _cached_html = html
-    _last_fetch_ts = time.time()
-
-    out = Path("morning_dashboard.html")
-    out.write_text(html)
-    ok = sum(1 for e in fetch_log if e['status']=='OK')
-    fail = sum(1 for e in fetch_log if e['status']=='FAIL')
-    print(f"\n  Saved: {out.absolute()}")
-    print(f"  Fetches: {ok} OK / {fail} FAIL\n")
-
-    _is_fetching = False
+    with _fetch_lock:
+        if _is_fetching:
+            print("  [SKIP] Already fetching, skipping duplicate call.")
+            return _cached_html
+        _is_fetching = True
     try:
-        Path("/mnt/user-data/outputs/morning_dashboard.html").write_text(html)
-        Path("/mnt/user-data/outputs/dashboard_v2.py").write_text(Path(__file__).read_text())
-    except: pass
-    return html
+        fetch_log = []  # reset log for each fetch cycle
+        now = datetime.now(UZT)
+        print(f"\n{'='*60}\n  BIAS DASHBOARD v2 — {now.strftime('%A %H:%M UZT')}")
+        if VERIFY: print("  ** VERIFY MODE **")
+        if serve_mode: print(f"  [SERVE] refresh cycle @ {now.strftime('%H:%M:%S')}")
+        print(f"{'='*60}\n")
+
+        crypto = {}
+        for a in ["BTC","ETH","SOL"]:
+            print(f"  [{a}] Perpetual...")
+            p = deribit_perp(a)
+            deribit_rate = _perp_funding_rate(p)
+            if p:
+                deribit_str = f"{deribit_rate*100:.4f}%" if deribit_rate is not None else "N/A"
+                print(f"  [{a}] ${p['index_price']:,.2f}  deribit_8h={deribit_str}")
+            bn = binance_funding(a)
+            if bn:
+                print(f"  [{a}] Binance funding={bn['funding_rate']*100:.4f}%")
+            g = None
+            if a in ["BTC","ETH"]:
+                print(f"  [{a}] Options GEX (~30s)...")
+                g = deribit_gex(a)
+                if g: print(f"  [{a}] {g['n']} contracts, flip={'${:,.0f}'.format(g['gamma_flip']) if g.get('gamma_flip') else 'N/A'}")
+            crypto[a] = {"perp": p, "gex": g, "binance": bn}
+
+        us_data = []
+        if not CRYPTO_ONLY and yf:
+            for sym in ["SPY","GLD","USO"]:
+                print(f"\n  [{sym}] 5-day history...")
+                hist = yf_history(sym)
+                if hist:
+                    print(f"  [{sym}] spot=${hist['spot']:,.2f}  5d={hist['pct_chg']:+.2f}%  HV={hist['hv_ann']*100:.1f}%")
+                    print(f"  [{sym}] Computing full Greeks...")
+                    greeks = yf_greeks(sym, hist)
+                    if greeks:
+                        print(f"  [{sym}] {greeks['n']} rows | {greeks['regime']} | weight={greeks.get('weight_label','OI')} | flip={'${:,.0f}'.format(greeks['gamma_flip']) if greeks.get('gamma_flip') else 'N/A'} | IV={greeks['avg_iv']*100:.1f}%")
+                        print(f"  [{sym}] Net Δ={greeks['totals']['delta']:+,.0f}  Θ={greeks['totals']['theta']:+,.0f}/d  V={greeks['totals']['vega']:+,.0f}")
+                    us_data.append((sym, hist, greeks))
+                else:
+                    print(f"  [{sym}] FAIL: no history"); us_data.append((sym, None, None))
+        elif CRYPTO_ONLY: print("\n  Skipping SPY/GLD (--crypto)")
+
+        conv = score(crypto, us_data)
+        html = build_html(crypto, us_data, conv, serve_mode=serve_mode)
+        _cached_html = html
+        _last_fetch_ts = time.time()
+
+        out = Path("morning_dashboard.html")
+        out.write_text(html)
+        ok = sum(1 for e in fetch_log if e['status']=='OK')
+        fail = sum(1 for e in fetch_log if e['status']=='FAIL')
+        print(f"\n  Saved: {out.absolute()}")
+        print(f"  Fetches: {ok} OK / {fail} FAIL\n")
+
+        try:
+            Path("/mnt/user-data/outputs/morning_dashboard.html").write_text(html)
+            Path("/mnt/user-data/outputs/dashboard_v2.py").write_text(Path(__file__).read_text())
+        except: pass
+        return html
+    finally:
+        with _fetch_lock:
+            _is_fetching = False
 
 # ── HTTP server for --serve mode ──────────────────────────────────────────────
 class DashboardHandler(BaseHTTPRequestHandler):

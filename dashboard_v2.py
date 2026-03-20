@@ -1271,8 +1271,8 @@ def score(crypto, us_data):
         if fr*100>0.02: sigs.append((f"BTC Binance funding +{fr*100:.4f}%: longs crowded [LIVE]","bearish"))
         elif fr*100<-0.02: sigs.append((f"BTC Binance funding {fr*100:.4f}%: shorts crowded [LIVE]","bullish"))
         else: sigs.append((f"BTC Binance funding {fr*100:.4f}%: neutral [LIVE]","neutral"))
-    elif bp and bp.get("current_funding") is not None:
-        fr = bp["current_funding"]
+    elif bp and _perp_funding_rate(bp) is not None:
+        fr = _perp_funding_rate(bp)
         if fr*100>0.02: sigs.append((f"BTC Deribit funding +{fr*100:.4f}%: longs crowded [LIVE]","bearish"))
         elif fr*100<-0.02: sigs.append((f"BTC Deribit funding {fr*100:.4f}%: shorts crowded [LIVE]","bullish"))
         else: sigs.append((f"BTC Deribit funding {fr*100:.4f}%: neutral [LIVE]","neutral"))
@@ -1300,11 +1300,11 @@ def score(crypto, us_data):
             elif iv_hv < -0.05: sigs.append((f"SPY IV−HV: {iv_hv*100:.0f}% — vol cheap [CALC]","bullish"))
             if greeks.get("pc_ratio") is not None:
                 pc_r = greeks["pc_ratio"]
-                if pc_r > 1.2: sigs.append((f"SPY P/C {pc_r:.2f}: heavy puts [CALC]","bearish"))
-                elif pc_r < 0.5: sigs.append((f"SPY P/C {pc_r:.2f}: call heavy [CALC]","bullish"))
+                if pc_r > 0.7: sigs.append((f"SPY P/C {pc_r:.2f}: put heavy [CALC]","bearish"))
+                elif pc_r < 0.3: sigs.append((f"SPY P/C {pc_r:.2f}: call heavy [CALC]","bullish"))
         if sym == "SPY" and hist:
-            if hist["pct_chg"] > 1: sigs.append((f"SPY 5d: +{hist['pct_chg']:.1f}% [LIVE]","bullish"))
-            elif hist["pct_chg"] < -1: sigs.append((f"SPY 5d: {hist['pct_chg']:.1f}% [LIVE]","bearish"))
+            if hist["pct_chg"] > 0.5: sigs.append((f"SPY 5d: +{hist['pct_chg']:.1f}% [LIVE]","bullish"))
+            elif hist["pct_chg"] < -0.5: sigs.append((f"SPY 5d: {hist['pct_chg']:.1f}% [LIVE]","bearish"))
         if sym == "USO":
             if greeks["net_gex"] > 0: sigs.append(("USO: positive γ — crude pinning [CALC]","neutral"))
             else: sigs.append(("USO: negative γ — crude trending [CALC]","neutral"))

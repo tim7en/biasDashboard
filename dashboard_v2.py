@@ -338,10 +338,13 @@ def deribit_gex(ccy):
         elif 0 < hrs_to_exp <= 48:
             expiring_soon["48h"]["call_oi" if c["type"] == "call" else "put_oi"] += c["oi"]
     crypto_opex = None
+    total_live_oi = sum(c["oi"] for c in cands)
     if expiring_soon.get("24h") and (expiring_soon["24h"]["call_oi"] + expiring_soon["24h"]["put_oi"]) > 0:
         d = expiring_soon["24h"]
+        total_oi = d["call_oi"] + d["put_oi"]
         crypto_opex = {"call_oi": d["call_oi"], "put_oi": d["put_oi"],
-                       "total_oi": d["call_oi"] + d["put_oi"], "window": "24h"}
+                       "total_oi": total_oi, "window": "24h",
+                       "share_pct": (total_oi / total_live_oi * 100) if total_live_oi else None}
 
     return {"spot": spot, "gex_levels": levels[:8], "gamma_flip": flip, "max_pain": mp,
             "pc_ratio": put_oi/call_oi if call_oi else None, "call_oi": call_oi, "put_oi": put_oi,
@@ -395,17 +398,32 @@ def _detect_opex(symbol, valid_exps, tk, spot):
         T_days = (datetime.strptime(exp, "%Y-%m-%d") - datetime.now()).days
         try:
             chain = tk.option_chain(exp)
-            c_oi = sum(_safe_oi(r.get("openInterest", 0)) for _, r in chain.calls.iterrows()
-                       if _safe_oi(r.get("openInterest", 0)) > 0 and
-                       spot * 0.90 < r.get("strike", 0) < spot * 1.10)
-            p_oi = sum(_safe_oi(r.get("openInterest", 0)) for _, r in chain.puts.iterrows()
-                       if _safe_oi(r.get("openInterest", 0)) > 0 and
-                       spot * 0.90 < r.get("strike", 0) < spot * 1.10)
-            total_oi = c_oi + p_oi
+            total_call_oi = sum(_safe_oi(r.get("openInterest", 0)) for _, r in chain.calls.iterrows())
+            total_put_oi = sum(_safe_oi(r.get("openInterest", 0)) for _, r in chain.puts.iterrows())
+            total_oi = total_call_oi + total_put_oi
             if total_oi <= 0:
                 continue
+            atm_call_oi = sum(_safe_oi(r.get("openInterest", 0)) for _, r in chain.calls.iterrows()
+                              if _safe_oi(r.get("openInterest", 0)) > 0 and
+                              spot * 0.90 < r.get("strike", 0) < spot * 1.10)
+            atm_put_oi = sum(_safe_oi(r.get("openInterest", 0)) for _, r in chain.puts.iterrows()
+                             if _safe_oi(r.get("openInterest", 0)) > 0 and
+                             spot * 0.90 < r.get("strike", 0) < spot * 1.10)
+            atm_total_oi = atm_call_oi + atm_put_oi
+            atm_share_pct = (atm_total_oi / total_oi * 100) if total_oi else 0
+            moderate_threshold = max(100, int(total_oi * 0.02))
+            high_threshold = max(300, int(total_oi * 0.05))
+            if atm_total_oi >= high_threshold:
+                impact = "high"
+            elif atm_total_oi >= moderate_threshold:
+                impact = "moderate"
+            else:
+                impact = "low"
             results.append({"exp": exp, "type": otype, "days": T_days,
-                            "call_oi": c_oi, "put_oi": p_oi, "total_oi": total_oi,
+                            "call_oi": total_call_oi, "put_oi": total_put_oi, "total_oi": total_oi,
+                            "atm_call_oi": atm_call_oi, "atm_put_oi": atm_put_oi, "atm_total_oi": atm_total_oi,
+                            "atm_share_pct": atm_share_pct, "impact": impact,
+                            "show_alert": atm_total_oi > 0 and impact != "low",
                             "is_today": exp == today, "is_tomorrow": exp == tomorrow})
         except:
             pass
@@ -656,11 +674,12 @@ def _market_bias(label, gex_data, hist_data=None, crypto_data=None, macro=None):
             opex = gex_data["opex"]
             if isinstance(opex, list):
                 for o in opex:
-                    if o.get("type") in ("MONTHLY", "QUARTERLY"):
-                        signals.append(("bear" if o["put_oi"] > o["call_oi"] else "bull",
-                                        f"{o['type']} OpEx {o['exp']} — {o['total_oi']:,} OI expiring"))
+                    if o.get("type") in ("MONTHLY", "QUARTERLY") and o.get("show_alert"):
+                        signals.append(("bear" if o["atm_put_oi"] > o["atm_call_oi"] else "bull",
+                                        f"{o['type']} OpEx {o['exp']} — {o['atm_total_oi']:,} ATM OI expiring"))
             elif isinstance(opex, dict):
-                signals.append(("neutral", f"Crypto OpEx {opex['window']} — {opex['total_oi']:,.0f} contracts"))
+                share = f" ({opex['share_pct']:.1f}% OI)" if opex.get("share_pct") is not None else ""
+                signals.append(("neutral", f"Crypto OpEx {opex['window']} — {opex['total_oi']:,.0f} contracts{share}"))
     if hist_data:
         if hist_data["pct_chg"] > 0.5: signals.append(("bull", f"5d momentum +{hist_data['pct_chg']:.1f}%"))
         elif hist_data["pct_chg"] < -0.5: signals.append(("bear", f"5d momentum {hist_data['pct_chg']:.1f}%"))
@@ -870,7 +889,8 @@ def build_narrative(crypto, us_data):
         # OpEx
         if btc_g.get("opex"):
             o = btc_g["opex"]
-            btc_str += f" <b style='color:#E24B4A'>OpEx alert:</b> {o['total_oi']:,.0f} contracts expire in {o['window']} — gamma unwind will increase volatility."
+            share = f" ({o['share_pct']:.1f}% of live OI)" if o.get("share_pct") is not None else ""
+            btc_str += f" <b style='color:#E24B4A'>OpEx alert:</b> {o['total_oi']:,.0f} contracts expire in {o['window']}{share} — possible gamma unwind / vol pickup."
         paras.append(f"<b>BTC</b><br>{btc_str}")
 
     if not paras:
@@ -897,13 +917,16 @@ def build_checklist(crypto, us_data, conviction, now, macro=None):
         g = crypto.get(sym, {}).get("gex")
         if g and g.get("opex"):
             o = g["opex"]
-            opex_warnings.append(f"<b>{sym}</b> {o['total_oi']:,.0f} contracts expire in {o['window']} — expect gamma unwind & vol spike")
+            share = f" ({o['share_pct']:.1f}% of live OI)" if o.get("share_pct") is not None else ""
+            opex_warnings.append(f"<b>{sym}</b> {o['total_oi']:,.0f} contracts expire in {o['window']}{share} — possible gamma unwind / vol pickup")
     for sym, hist, greeks in us_data:
         if greeks and greeks.get("opex"):
             for o in greeks["opex"]:
+                if not o.get("show_alert"):
+                    continue
                 tag = f"<b style='color:#E24B4A'>{o['type']}</b>" if o["type"] in ("MONTHLY","QUARTERLY") else o["type"]
                 day = "TODAY" if o["is_today"] else "TOMORROW"
-                opex_warnings.append(f"<b>{sym}</b> {tag} OpEx {day} ({o['exp']}) — {o['total_oi']:,} OI near ATM | C:{o['call_oi']:,} P:{o['put_oi']:,}")
+                opex_warnings.append(f"<b>{sym}</b> {tag} OpEx {day} ({o['exp']}) — {o['total_oi']:,} total OI | {o['atm_total_oi']:,} near ATM ({o['atm_share_pct']:.1f}%) | C:{o['atm_call_oi']:,} P:{o['atm_put_oi']:,}")
     if opex_warnings:
         steps.append(("2","OpEx alert", "<br>".join(opex_warnings), "#E24B4A"))
     else:
@@ -1150,7 +1173,8 @@ def build_html(crypto, us_data, conviction, macro=None, serve_mode=False):
             crypto_opex_badge = ""
             if gex.get("opex"):
                 o = gex["opex"]
-                crypto_opex_badge = f'<div style="padding:4px 10px;border-radius:4px;font-size:10px;font-weight:600;color:#E24B4A;background:#E24B4A10;margin-bottom:6px">⚡ {o["total_oi"]:,.0f} contracts expire in {o["window"]} — gamma unwind risk</div>'
+                share = f' ({o["share_pct"]:.1f}% OI)' if o.get("share_pct") is not None else ""
+                crypto_opex_badge = f'<div style="padding:4px 10px;border-radius:4px;font-size:10px;font-weight:600;color:#E24B4A;background:#E24B4A10;margin-bottom:6px">⚡ {o["total_oi"]:,.0f} contracts expire in {o["window"]}{share} — possible gamma unwind / vol pickup</div>'
             gh = f'''<div style="margin-top:10px;padding-top:8px;border-top:1px solid #eee">
               {crypto_opex_badge}
               <div style="font-size:10px;font-weight:600;color:#666;margin-bottom:4px">GEX <span style="color:#bbb;font-weight:400">[CALC {gex["n"]} contracts]</span></div>
@@ -1219,9 +1243,11 @@ def build_html(crypto, us_data, conviction, macro=None, serve_mode=False):
             opex_badge = ""
             if greeks.get("opex"):
                 for o in greeks["opex"]:
+                    if not o.get("show_alert"):
+                        continue
                     oc = "#E24B4A" if o["type"] in ("MONTHLY","QUARTERLY") else "#EF9F27"
                     day_label = "TODAY" if o["is_today"] else "TOMORROW"
-                    opex_badge += f'<div style="padding:4px 10px;border-radius:4px;font-size:10px;font-weight:600;color:{oc};background:{oc}10;margin-bottom:6px">⚡ {o["type"]} OpEx {day_label} — {o["total_oi"]:,} OI expiring near ATM (C:{o["call_oi"]:,} P:{o["put_oi"]:,})</div>'
+                    opex_badge += f'<div style="padding:4px 10px;border-radius:4px;font-size:10px;font-weight:600;color:{oc};background:{oc}10;margin-bottom:6px">⚡ {o["type"]} OpEx {day_label} — {o["total_oi"]:,} total OI | {o["atm_total_oi"]:,} near ATM ({o["atm_share_pct"]:.1f}%)</div>'
 
             greeks_section = f'''
             {opex_badge}

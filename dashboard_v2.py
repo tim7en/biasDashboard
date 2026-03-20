@@ -26,7 +26,7 @@ IMPORTANT: Every number in the output is tagged with:
   [FAIL]  = fetch failed, no data shown (never synthesized)
 """
 
-import requests, json, math, sys, os, time, threading
+import requests, json, math, sys, os, time, threading, csv, io
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from pathlib import Path
@@ -57,6 +57,8 @@ SERVE = "--serve" in sys.argv
 SERVE_PORT = 8050
 REFRESH_INTERVAL = 300  # seconds (5 min)
 YF_MAX_EXPIRIES = 12
+DXY_TICKERS = ["DX-Y.NYB", "DX=F", "UUP"]
+FRED_BROAD_USD_SERIES = "DTWEXBGS"
 fetch_log = []
 _cached_html = ""
 _last_fetch_ts = 0
@@ -120,6 +122,123 @@ def _yf_weight_value(row, field):
     if field == "volume":
         return _safe_oi(row.get("volume", 0))
     return _safe_oi(row.get("openInterest", 0))
+
+def _pct_change(series, lookback):
+    if not series or len(series) <= lookback:
+        return None
+    base = series[-(lookback + 1)]
+    if not base:
+        return None
+    return (series[-1] / base - 1) * 100
+
+def _color_pct(pct):
+    if pct is None:
+        return "#888"
+    return "#E24B4A" if pct > 0 else "#1D9E75" if pct < 0 else "#888"
+
+def _fmt_pct(pct, digits=2):
+    if pct is None:
+        return "N/A"
+    return f"{pct:+.{digits}f}%"
+
+def _macro_leg_bias(pct_5d, pct_20d):
+    score = 0
+    if pct_5d is not None:
+        if pct_5d >= 0.30:
+            score += 1
+        elif pct_5d <= -0.30:
+            score -= 1
+    if pct_20d is not None:
+        if pct_20d >= 0.75:
+            score += 1
+        elif pct_20d <= -0.75:
+            score -= 1
+    if score >= 2:
+        return "bull"
+    if score <= -2:
+        return "bear"
+    return "neutral"
+
+def yf_macro_proxy(symbols, days=25):
+    if not yf:
+        return None
+    for symbol in symbols:
+        try:
+            tk = yf.Ticker(symbol)
+            hist = tk.history(period=f"{days + 10}d")
+            closes = [float(v) for v in hist.get("Close", []).dropna().tail(days + 1)]
+            if len(closes) < 6:
+                continue
+            latest = closes[-1]
+            pct_5d = _pct_change(closes, 5)
+            pct_20d = _pct_change(closes, 20)
+            log("yfinance", f"{symbol}/macro", "OK", f"last={latest:.2f} 5d={pct_5d}")
+            return {"symbol": symbol, "latest": latest, "pct_5d": pct_5d, "pct_20d": pct_20d, "_src": "Yahoo"}
+        except Exception as e:
+            log("yfinance", f"{symbol}/macro", "FAIL", str(e))
+    return None
+
+def fred_series(series_id, days=25):
+    try:
+        r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
+                         params={"id": series_id}, timeout=10)
+        r.raise_for_status()
+        rows = []
+        for row in csv.DictReader(io.StringIO(r.text)):
+            val = row.get(series_id)
+            if not val or val == ".":
+                continue
+            rows.append((row.get("DATE"), float(val)))
+        if len(rows) < 6:
+            log("FRED", series_id, "FAIL", "insufficient rows")
+            return None
+        rows = rows[-(days + 1):]
+        values = [v for _, v in rows]
+        pct_5d = _pct_change(values, 5)
+        pct_20d = _pct_change(values, 20)
+        log("FRED", series_id, "OK", f"last={values[-1]:.2f} 5d={pct_5d}")
+        return {"series": series_id, "date": rows[-1][0], "latest": values[-1],
+                "pct_5d": pct_5d, "pct_20d": pct_20d, "_src": "FRED"}
+    except Exception as e:
+        log("FRED", series_id, "FAIL", str(e))
+        return None
+
+def usd_macro():
+    dxy = yf_macro_proxy(DXY_TICKERS)
+    broad = fred_series(FRED_BROAD_USD_SERIES)
+    if not dxy and not broad:
+        return None
+
+    dxy_bias = _macro_leg_bias(dxy.get("pct_5d") if dxy else None, dxy.get("pct_20d") if dxy else None)
+    broad_bias = _macro_leg_bias(broad.get("pct_5d") if broad else None, broad.get("pct_20d") if broad else None)
+
+    if dxy and broad and dxy_bias == broad_bias and dxy_bias in ("bull", "bear"):
+        bias = dxy_bias
+    elif dxy and not broad and dxy_bias in ("bull", "bear"):
+        bias = dxy_bias
+    elif broad and not dxy and broad_bias in ("bull", "bear"):
+        bias = broad_bias
+    else:
+        bias = "neutral"
+
+    if bias == "bull":
+        label, color = "USD strong", "#E24B4A"
+        reason = "Dollar strength is a macro headwind for BTC, gold, crude, and broad risk."
+    elif bias == "bear":
+        label, color = "USD weak", "#1D9E75"
+        reason = "Dollar weakness is a macro tailwind for BTC, gold, crude, and broad risk."
+    else:
+        label, color = "USD mixed", "#EF9F27"
+        reason = "DXY and the broad dollar index are not aligned strongly enough for a directional macro call."
+
+    parts = []
+    if dxy:
+        parts.append(f"DXY proxy {_fmt_pct(dxy.get('pct_5d'))} (5d)")
+    if broad:
+        parts.append(f"broad USD {_fmt_pct(broad.get('pct_5d'))} (5d)")
+
+    return {"bias": bias, "label": label, "color": color, "reason": reason,
+            "summary": " · ".join(parts), "dxy": dxy, "broad_usd": broad}
 
 # ── Deribit ───────────────────────────────────────────────────────────────────
 def binance_funding(ccy):
@@ -413,6 +532,9 @@ def yf_greeks(symbol, hist_data):
         # OpEx detection — OI expiring today/tomorrow
         opex_info = _detect_opex(symbol, valid_exps, tk, spot)
 
+        confidence_label = "OI-backed" if weight_source == "openInterest" else "Volume proxy"
+        confidence_color = "#1D9E75" if weight_source == "openInterest" else "#EF9F27"
+
         return {"symbol": symbol, "spot": spot, "gex_levels": levels, "gamma_flip": flip,
                 "max_pain": mp, "net_gex": net_gex, "pc_ratio": pc,
                 "call_oi": c_oi, "put_oi": p_oi, "n": n, "exps": [c["exp"] for c in chains],
@@ -421,6 +543,8 @@ def yf_greeks(symbol, hist_data):
                 "avg_iv": avg_iv, "avg_iv_vs_hv": avg_iv - hv, "hv": hv,
                 "opex": opex_info, "weight_source": weight_source,
                 "weight_label": weight_label, "pc_label": pc_label,
+                "confidence_label": confidence_label, "confidence_color": confidence_color,
+                "directional_quality": "full" if weight_source == "openInterest" else "proxy",
                 "weight_note": "" if weight_source == "openInterest" else "Volume-weighted fallback — Yahoo open interest is zero across sampled expiries.",
                 "sampled_rows": sampled_rows, "_src": "Yahoo+BS"}
     except Exception as e:
@@ -468,19 +592,66 @@ def bar_html(val, mx, max_w=80):
     c = "#1D9E75" if val >= 0 else "#E24B4A"
     return f'<div style="height:5px;width:{w:.0f}px;background:{c};border-radius:2px;min-width:2px;display:inline-block"></div>'
 
+def build_macro_card(macro):
+    if not macro:
+        return ""
+    dxy = macro.get("dxy")
+    broad = macro.get("broad_usd")
+    tone = macro["label"]
+    tone_color = macro["color"]
+
+    dxy_symbol = dxy.get("symbol") if dxy else "N/A"
+    broad_symbol = broad.get("series") if broad else "N/A"
+    dxy_latest = f"{dxy['latest']:.2f}" if dxy else "N/A"
+    broad_latest = f"{broad['latest']:.2f}" if broad else "N/A"
+    broad_date = f" ({broad['date']})" if broad and broad.get("date") else ""
+
+    return f'''<div class="card" style="margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+        <div>
+          <div class="card-title" style="margin-bottom:2px">USD macro overlay</div>
+          <div style="font-size:10px;color:#888">{macro["reason"]}</div>
+        </div>
+        <div style="padding:4px 10px;border-radius:999px;font-size:10px;font-weight:700;color:{tone_color};background:{tone_color}12">{tone}</div>
+      </div>
+      <div class="metric-row">
+        <div class="metric">
+          <div class="metric-label">DXY proxy {dxy_symbol} <span class="tag">[LIVE]</span></div>
+          <div class="metric-value">{dxy_latest}</div>
+          <div style="font-size:10px;color:{_color_pct(dxy.get("pct_5d") if dxy else None)}">{_fmt_pct(dxy.get("pct_5d") if dxy else None)} 5d · {_fmt_pct(dxy.get("pct_20d") if dxy else None)} 20d</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Broad USD {broad_symbol} <span class="tag">[LIVE]</span></div>
+          <div class="metric-value">{broad_latest}</div>
+          <div style="font-size:10px;color:{_color_pct(broad.get("pct_5d") if broad else None)}">{_fmt_pct(broad.get("pct_5d") if broad else None)} 5d · {_fmt_pct(broad.get("pct_20d") if broad else None)} 20d</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Macro read</div>
+          <div class="metric-value" style="color:{tone_color}">{tone}</div>
+          <div style="font-size:10px;color:#888">{macro.get("summary","")}</div>
+        </div>
+      </div>
+      <div style="margin-top:6px;font-size:10px;color:#888">DXY is a live market proxy. Broad USD is the official FRED index and updates daily{broad_date}.</div>
+    </div>'''
+
 # ── Checklist ─────────────────────────────────────────────────────────────────
-def _market_bias(label, gex_data, hist_data=None, crypto_data=None):
+def _market_bias(label, gex_data, hist_data=None, crypto_data=None, macro=None):
     """Compute directional bias for a specific market open. Returns (direction, reasons, color)."""
     signals = []
     if gex_data:
-        if gex_data["net_gex"] > 0:
-            signals.append(("bull", "positive γ — pinning/mean-revert"))
-        else:
-            signals.append(("bear", "negative γ — trend/breakout"))
-        if gex_data.get("pc_ratio") is not None:
-            pc = gex_data["pc_ratio"]
-            if pc > 0.7: signals.append(("bear", f"P/C {pc:.2f} — put heavy"))
-            elif pc < 0.3: signals.append(("bull", f"P/C {pc:.2f} — call heavy"))
+        asset = gex_data.get("symbol", label)
+        options_confident = gex_data.get("weight_source", "openInterest") == "openInterest"
+        if options_confident:
+            if gex_data["net_gex"] > 0:
+                signals.append(("bull", "positive γ — pinning/mean-revert"))
+            else:
+                signals.append(("bear", "negative γ — trend/breakout"))
+            if gex_data.get("pc_ratio") is not None:
+                pc = gex_data["pc_ratio"]
+                if pc > 0.7: signals.append(("bear", f"P/C {pc:.2f} — put heavy"))
+                elif pc < 0.3: signals.append(("bull", f"P/C {pc:.2f} — call heavy"))
+        elif gex_data.get("weight_source") == "volume":
+            signals.append(("neutral", f"{asset} options proxy only — volume fallback"))
         if gex_data.get("opex"):
             opex = gex_data["opex"]
             if isinstance(opex, list):
@@ -495,23 +666,30 @@ def _market_bias(label, gex_data, hist_data=None, crypto_data=None):
         elif hist_data["pct_chg"] < -0.5: signals.append(("bear", f"5d momentum {hist_data['pct_chg']:.1f}%"))
     if gex_data and gex_data.get("avg_iv_vs_hv") is not None:
         iv_hv = gex_data["avg_iv_vs_hv"]
-        if iv_hv > 0.10: signals.append(("bear", f"IV−HV +{iv_hv*100:.0f}% — fear elevated"))
-        elif iv_hv < -0.05: signals.append(("bull", f"IV−HV {iv_hv*100:.0f}% — vol cheap"))
+        if gex_data.get("weight_source", "openInterest") == "openInterest":
+            if iv_hv > 0.10: signals.append(("bear", f"IV−HV +{iv_hv*100:.0f}% — fear elevated"))
+            elif iv_hv < -0.05: signals.append(("bull", f"IV−HV {iv_hv*100:.0f}% — vol cheap"))
     if crypto_data:
-        for sym in ["BTC", "ETH"]:
+        for sym, thresh in [("BTC", 0.02), ("ETH", 0.02), ("SOL", 0.03)]:
             bn = crypto_data.get(sym, {}).get("binance")
             p = crypto_data.get(sym, {}).get("perp")
             # prefer Binance (more representative), fall back to Deribit
             if bn:
                 fr = bn["funding_rate"] * 100
                 src = "Binance"
-            elif p and p.get("current_funding") is not None:
-                fr = p["current_funding"] * 100
-                src = "Deribit"
             else:
-                continue
-            if fr > 0.02: signals.append(("bear", f"{sym} funding +{fr:.4f}% ({src}) — longs crowded"))
-            elif fr < -0.02: signals.append(("bull", f"{sym} funding {fr:.4f}% ({src}) — shorts crowded"))
+                fallback_rate = _perp_funding_rate(p)
+                if fallback_rate is None:
+                    continue
+                fr = fallback_rate * 100
+                src = "Deribit"
+            if fr > thresh: signals.append(("bear", f"{sym} funding +{fr:.4f}% ({src}) — longs crowded"))
+            elif fr < -thresh: signals.append(("bull", f"{sym} funding {fr:.4f}% ({src}) — shorts crowded"))
+    if macro:
+        if macro.get("bias") == "bull":
+            signals.append(("bear", "USD strong — macro headwind"))
+        elif macro.get("bias") == "bear":
+            signals.append(("bull", "USD weak — macro tailwind"))
 
     bulls = sum(1 for d, _ in signals if d == "bull")
     bears = sum(1 for d, _ in signals if d == "bear")
@@ -703,7 +881,7 @@ def build_narrative(crypto, us_data):
       <div class="card-title">Market regime analysis</div>
       <div style="line-height:1.6;font-size:11px">{body}</div></div>'''
 
-def build_checklist(crypto, us_data, conviction, now):
+def build_checklist(crypto, us_data, conviction, now, macro=None):
     steps = []
     h = now.hour
     weekday = now.weekday()
@@ -744,7 +922,7 @@ def build_checklist(crypto, us_data, conviction, now):
     market_biases = []
 
     # Tokyo/Seoul (05:00 UZT) — crypto-driven, use BTC/ETH data
-    d, sigs, c = _market_bias("Tokyo/Seoul", btc_gex, crypto_data=crypto)
+    d, sigs, c = _market_bias("Tokyo/Seoul", btc_gex, crypto_data=crypto, macro=macro)
     key_lvls = []
     if btc_gex:
         if btc_gex.get("gamma_flip"): key_lvls.append(f"BTC flip ${btc_gex['gamma_flip']:,.0f}")
@@ -754,7 +932,7 @@ def build_checklist(crypto, us_data, conviction, now):
     market_biases.append(f"<div id='bias-tokyo' style='margin-bottom:6px;transition:all .3s'><b>Tokyo/Seoul 05:00</b> — <span style='color:{c};font-weight:700'>{d}</span>{lvl_str}<br><span style='color:#888;font-size:10px'>{reasons}</span></div>")
 
     # London (13:00 UZT) — crypto + equity overlap
-    d, sigs, c = _market_bias("London", spy_greeks, spy_hist, crypto)
+    d, sigs, c = _market_bias("London", spy_greeks, spy_hist, crypto, macro)
     key_lvls = []
     if spy_greeks and spy_greeks.get("gamma_flip"): key_lvls.append(f"SPY flip ${spy_greeks['gamma_flip']:,.0f}")
     if spy_greeks and spy_greeks.get("max_pain"): key_lvls.append(f"SPY pain ${spy_greeks['max_pain']:,.0f}")
@@ -764,7 +942,7 @@ def build_checklist(crypto, us_data, conviction, now):
     market_biases.append(f"<div id='bias-london' style='margin-bottom:6px;transition:all .3s'><b>London 13:00</b> — <span style='color:{c};font-weight:700'>{d}</span>{lvl_str}<br><span style='color:#888;font-size:10px'>{reasons}</span></div>")
 
     # US open (19:30 UZT) — full equity focus
-    d, sigs, c = _market_bias("US", spy_greeks, spy_hist, crypto)
+    d, sigs, c = _market_bias("US", spy_greeks, spy_hist, crypto, macro)
     key_lvls = []
     if spy_greeks and spy_greeks.get("gamma_flip"): key_lvls.append(f"SPY flip ${spy_greeks['gamma_flip']:,.0f}")
     if spy_greeks and spy_greeks.get("max_pain"): key_lvls.append(f"SPY pain ${spy_greeks['max_pain']:,.0f}")
@@ -854,7 +1032,7 @@ POWER_HOUR_JS = """
 """
 
 # ── Main HTML build ───────────────────────────────────────────────────────────
-def build_html(crypto, us_data, conviction, serve_mode=False):
+def build_html(crypto, us_data, conviction, macro=None, serve_mode=False):
     now = datetime.now(UZT)
     fetch_epoch = int(now.timestamp())
     h = now.hour; wd = now.weekday()
@@ -866,7 +1044,8 @@ def build_html(crypto, us_data, conviction, serve_mode=False):
     elif 19<=h<24:sess,sc = "US session","#E24B4A"
     else:         sess,sc = "Off-hours","#888"
 
-    checklist = build_checklist(crypto, us_data, conviction, now)
+    checklist = build_checklist(crypto, us_data, conviction, now, macro=macro)
+    macro_card = build_macro_card(macro)
 
     # Refresh button + data age bar
     rerun_note = "" if serve_mode else ' <span style="font-size:8px;color:#bbb">(re-run script for fresh data)</span>'
@@ -1009,6 +1188,8 @@ def build_html(crypto, us_data, conviction, serve_mode=False):
         sl = sparkline_svg(hist["closes"])
         pchg_col = "#1D9E75" if hist["pct_chg"] > 0 else "#E24B4A"
         daily_rets = " ".join(f'<span style="color:{"#1D9E75" if r>0 else "#E24B4A"}">{r*100:+.2f}%</span>' for r in hist["returns"])
+        conf_label = greeks.get("confidence_label", "N/A") if greeks else "N/A"
+        conf_color = greeks.get("confidence_color", "#888") if greeks else "#888"
 
         greeks_section = ""
         if greeks:
@@ -1090,7 +1271,7 @@ def build_html(crypto, us_data, conviction, serve_mode=False):
               <span style="color:#888;font-size:13px">${hist["spot"]:,.2f} <span class="tag">[LIVE]</span></span>
               <span style="color:{pchg_col};font-size:11px;margin-left:4px">{hist["pct_chg"]:+.2f}% (5d)</span>
             </div>
-            <div style="display:flex;align-items:center;gap:8px">{sl}<span class="tag">Yahoo+BS</span></div>
+            <div style="display:flex;align-items:center;gap:8px">{sl}<span style="font-size:9px;padding:2px 6px;border-radius:999px;background:{conf_color}12;color:{conf_color};font-weight:700">{conf_label}</span><span class="tag">Yahoo+BS</span></div>
           </div>
           <div style="font-size:9px;color:#bbb;margin-bottom:6px">5d returns: {daily_rets}</div>
           {greeks_section}</div>'''
@@ -1182,7 +1363,8 @@ a:hover{{opacity:.7}}
   <span id="session-badge" style="padding:3px 10px;border-radius:4px;font-size:10px;font-weight:600;color:{sc};background:{sc}12">{sess}</span></div>
 {refresh_bar}
 {POWER_HOUR_JS}
-{checklist}
+    {macro_card}
+    {checklist}
 <script>
 (function(){{
   var PH2=[[5,0,"Tokyo/Seoul open"],[6,30,"Shanghai/HK open"],[13,0,"London open"],[19,30,"US open"],[0,0,"US power hour"],[1,0,"US close"]];
@@ -1261,7 +1443,7 @@ a:hover{{opacity:.7}}
 <div style="margin-top:8px;text-align:center;font-size:8px;color:#ccc">[LIVE]=API fetched · [CALC]=Black-Scholes from IV · Zero synthesized values</div></body></html>'''
 
 # ── Conviction scorer ─────────────────────────────────────────────────────────
-def score(crypto, us_data):
+def score(crypto, us_data, macro=None):
     sigs = []
     b = crypto.get("BTC",{})
     bp, bg, bn = b.get("perp"), b.get("gex"), b.get("binance")
@@ -1282,6 +1464,11 @@ def score(crypto, us_data):
         fr_e = eth_bn["funding_rate"]
         if fr_e*100>0.02: sigs.append((f"ETH Binance funding +{fr_e*100:.4f}%: longs crowded [LIVE]","bearish"))
         elif fr_e*100<-0.02: sigs.append((f"ETH Binance funding {fr_e*100:.4f}%: shorts crowded [LIVE]","bullish"))
+    sol_bn = crypto.get("SOL",{}).get("binance")
+    if sol_bn:
+        fr_s = sol_bn["funding_rate"]
+        if fr_s*100>0.03: sigs.append((f"SOL Binance funding +{fr_s*100:.4f}%: longs crowded [LIVE]","bearish"))
+        elif fr_s*100<-0.03: sigs.append((f"SOL Binance funding {fr_s*100:.4f}%: shorts crowded [LIVE]","bullish"))
     if bg:
         if bg["net_gex"]>0: sigs.append(("BTC GEX: positive γ [CALC]","neutral"))
         else: sigs.append(("BTC GEX: negative γ [CALC]","neutral"))
@@ -1290,28 +1477,42 @@ def score(crypto, us_data):
             if pc>0.7: sigs.append((f"BTC P/C {pc:.2f}: bearish [CALC]","bearish"))
             elif pc<0.3: sigs.append((f"BTC P/C {pc:.2f}: bullish [CALC]","bullish"))
             else: sigs.append((f"BTC P/C {pc:.2f}: balanced [CALC]","neutral"))
+    if macro:
+        if macro.get("bias") == "bull":
+            sigs.append(("USD strong: macro headwind for BTC/commodities/risk [LIVE]","bearish"))
+        elif macro.get("bias") == "bear":
+            sigs.append(("USD weak: macro tailwind for BTC/commodities/risk [LIVE]","bullish"))
+        else:
+            sigs.append(("USD mixed: no clear dollar impulse [LIVE]","neutral"))
     for sym, hist, greeks in us_data:
         if not greeks: continue
+        oi_backed = greeks.get("weight_source", "openInterest") == "openInterest"
         if sym == "SPY":
-            if greeks["net_gex"] > 0: sigs.append(("SPY: positive γ — risk-on [CALC]","bullish"))
-            else: sigs.append(("SPY: negative γ — risk-off [CALC]","bearish"))
-            iv_hv = greeks["avg_iv_vs_hv"]
-            if iv_hv > 0.10: sigs.append((f"SPY IV−HV: +{iv_hv*100:.0f}% — fear elevated [CALC]","bearish"))
-            elif iv_hv < -0.05: sigs.append((f"SPY IV−HV: {iv_hv*100:.0f}% — vol cheap [CALC]","bullish"))
-            if greeks.get("pc_ratio") is not None:
-                pc_r = greeks["pc_ratio"]
-                if pc_r > 0.7: sigs.append((f"SPY P/C {pc_r:.2f}: put heavy [CALC]","bearish"))
-                elif pc_r < 0.3: sigs.append((f"SPY P/C {pc_r:.2f}: call heavy [CALC]","bullish"))
+            if oi_backed:
+                if greeks["net_gex"] > 0: sigs.append(("SPY: positive γ — risk-on [CALC]","bullish"))
+                else: sigs.append(("SPY: negative γ — risk-off [CALC]","bearish"))
+                iv_hv = greeks["avg_iv_vs_hv"]
+                if iv_hv > 0.10: sigs.append((f"SPY IV−HV: +{iv_hv*100:.0f}% — fear elevated [CALC]","bearish"))
+                elif iv_hv < -0.05: sigs.append((f"SPY IV−HV: {iv_hv*100:.0f}% — vol cheap [CALC]","bullish"))
+                if greeks.get("pc_ratio") is not None:
+                    pc_r = greeks["pc_ratio"]
+                    if pc_r > 0.7: sigs.append((f"SPY P/C {pc_r:.2f}: put heavy [CALC]","bearish"))
+                    elif pc_r < 0.3: sigs.append((f"SPY P/C {pc_r:.2f}: call heavy [CALC]","bullish"))
+            else:
+                sigs.append(("SPY options: volume proxy only — not scored directionally [CALC]","neutral"))
         if sym == "SPY" and hist:
             if hist["pct_chg"] > 0.5: sigs.append((f"SPY 5d: +{hist['pct_chg']:.1f}% [LIVE]","bullish"))
             elif hist["pct_chg"] < -0.5: sigs.append((f"SPY 5d: {hist['pct_chg']:.1f}% [LIVE]","bearish"))
         if sym == "USO":
-            if greeks["net_gex"] > 0: sigs.append(("USO: positive γ — crude pinning [CALC]","neutral"))
-            else: sigs.append(("USO: negative γ — crude trending [CALC]","neutral"))
-            if greeks.get("pc_ratio") is not None:
-                pc_o = greeks["pc_ratio"]
-                if pc_o > 1.0: sigs.append((f"USO P/C {pc_o:.2f}: put heavy [CALC]","bearish"))
-                elif pc_o < 0.4: sigs.append((f"USO P/C {pc_o:.2f}: call heavy [CALC]","bullish"))
+            if oi_backed:
+                if greeks["net_gex"] > 0: sigs.append(("USO: positive γ — crude pinning [CALC]","neutral"))
+                else: sigs.append(("USO: negative γ — crude trending [CALC]","neutral"))
+                if greeks.get("pc_ratio") is not None:
+                    pc_o = greeks["pc_ratio"]
+                    if pc_o > 1.0: sigs.append((f"USO P/C {pc_o:.2f}: put heavy [CALC]","bearish"))
+                    elif pc_o < 0.4: sigs.append((f"USO P/C {pc_o:.2f}: call heavy [CALC]","bullish"))
+            else:
+                sigs.append(("USO options: volume proxy only — informational only [CALC]","neutral"))
             if hist and abs(hist["pct_chg"]) > 3:
                 if hist["pct_chg"] > 3: sigs.append((f"USO 5d: +{hist['pct_chg']:.1f}% — crude rally [LIVE]","bullish"))
                 else: sigs.append((f"USO 5d: {hist['pct_chg']:.1f}% — crude selloff [LIVE]","bearish"))
@@ -1398,8 +1599,14 @@ def fetch_all(serve_mode=False):
                     print(f"  [{sym}] FAIL: no history"); us_data.append((sym, None, None))
         elif CRYPTO_ONLY: print("\n  Skipping SPY/GLD (--crypto)")
 
-        conv = score(crypto, us_data)
-        html = build_html(crypto, us_data, conv, serve_mode=serve_mode)
+        macro = usd_macro()
+        if macro:
+            dxy_desc = _fmt_pct(macro.get("dxy", {}).get("pct_5d")) if macro.get("dxy") else "N/A"
+            broad_desc = _fmt_pct(macro.get("broad_usd", {}).get("pct_5d")) if macro.get("broad_usd") else "N/A"
+            print(f"\n  [USD] {macro['label']} | DXY 5d={dxy_desc} | Broad USD 5d={broad_desc}")
+
+        conv = score(crypto, us_data, macro=macro)
+        html = build_html(crypto, us_data, conv, macro=macro, serve_mode=serve_mode)
         _cached_html = html
         _last_fetch_ts = time.time()
 

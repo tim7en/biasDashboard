@@ -1,0 +1,4 @@
+requests>=2.31.0
+yfinance>=0.2.36
+scipy>=1.11.0
+numpy>=1.24.0

@@ -1073,7 +1073,7 @@ def build_html(crypto, us_data, conviction, macro=None, serve_mode=False):
     rerun_note = "" if serve_mode else ' <span style="font-size:8px;color:#bbb">(re-run script for fresh data)</span>'
     refresh_bar = f'''
     <!-- Updating banner (hidden by default, shown by JS when fetching) -->
-    <div id="updating-banner" style="display:none;background:#1D9E7512;border:1px solid #1D9E7544;border-radius:8px;padding:6px 14px;margin-bottom:8px;font-size:10px;font-weight:600;color:#1D9E75;display:none;align-items:center;gap:8px">
+    <div id="updating-banner" style="display:none;background:#1D9E7512;border:1px solid #1D9E7544;border-radius:8px;padding:6px 14px;margin-bottom:8px;font-size:10px;font-weight:600;color:#1D9E75;align-items:center;gap:8px">
       <div style="width:10px;height:10px;border:2px solid #1D9E75;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0"></div>
       Fetching fresh data in background... dashboard will reload automatically when ready.
     </div>
@@ -1134,12 +1134,16 @@ def build_html(crypto, us_data, conviction, macro=None, serve_mode=False):
           }}
         }}).catch(function(){{}});
       }}
-      if(serve) setInterval(pollStatus, 5000);
+      if(serve){{pollStatus();setInterval(pollStatus, 5000);}}
 
-      function triggerRefresh(){{
+      window.triggerRefresh=function(){{
+        var banner=document.getElementById('updating-banner');
+        var btn=document.getElementById('refresh-btn');
+        if(banner){{banner.style.display='flex';}}
+        if(btn){{btn.disabled=true;btn.style.opacity='0.5';}}
         if(!serve){{window.location.reload();return;}}
         window.location.href='/refresh';
-      }}
+      }};
     }})();
     </script>'''
 
